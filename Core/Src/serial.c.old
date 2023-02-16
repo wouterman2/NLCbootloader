@@ -1,0 +1,344 @@
+//-----------------------------------------------------------------------------
+//! \file       serial.c
+//! \author     R. Weimar. RMB Holland bv
+//! \brief      Contains routines for the serial module
+//! \details
+//! \Attention
+//! \Created on: Apr 27, 2022
+//!  The software is equipped to handle UART:
+//!  - UART2 (115200 baud)
+//!
+//!  The software is a start of the UART communication between coffee machine and Linux
+//!  It will simply return a Success return message unless the CRC is wrong. Then it will send a CRC Error message
+//!  The protocol for the coffee machine is written below:
+//!
+//!  The protocol for the coffee machine is written in 80482201_UART protocol V1.x.xlsm
+//!
+//-----------------------------------------------------------------------------
+
+#include "serial.h"
+#include "usart.h"
+#include "crc.h"
+#include "utils.h"
+#include "work.h"
+#include "led.h"
+//#include "filter.h"
+#include "flash.h"
+#include "eeprom.h"
+#include "main.h"
+#include <stdint.h>
+#include <string.h>
+
+//! \CRC value calculated
+uint8_t CalculatedCRC;
+//! \UART message structure
+stcUARTMessage Message;
+//! \UART handle
+uint8_t UartReturn;
+//! \UART busy flag
+uint8_t SER_Busy;
+
+//-----------------------------------------------------------------------------
+//! \brief      Initiates the serial unit
+//! \details    Sets up Message buffer. Starts UART
+//! \param      None
+void SER_Init (void)
+{
+	Message.RxBuffer ='\000';
+	HAL_UART_Receive_DMA(&huart3, &Message.RxBuffer, 1);
+	HAL_UART_Receive_DMA(&huart2, &Message.RxBuffer, 1);
+}
+
+//-----------------------------------------------------------------------------
+//! \brief      Sets the status of the return message of actions
+//! \details    the work module confirms accepting or timing out.
+//! \param[in]  uint8_t newStatus	Status of the return message
+void SER_SetStatus (uint8_t newStatus)
+{
+	SER_SendReturnMessage (10, newStatus);
+}
+
+//! \brief      Sends a return message to the corresponding UART
+//! \details    Calculates CRC, fills the buffer and sends the buffer
+//! \param[in]  uint8_t newLength	Length of the message
+//! \param[in]  uint8_t newStatus	Status of the return message
+void SER_SendReturnMessage (uint8_t newLength, uint8_t newStatus)
+{
+	uint8_t newCRC;
+	//Fill length in data buffer
+	Message.RxData[2]=UTL_Dec2Asc(newLength / 16);
+	Message.RxData[3]=UTL_Dec2Asc(newLength % 16);
+	//Fill status in data buffer
+	if (newLength > 8)
+	{
+		Message.RxData[8]=UTL_Dec2Asc(newStatus / 16);
+		Message.RxData[9]=UTL_Dec2Asc(newStatus % 16);
+	}
+	//Calculate CRC and store it in data buffer
+	newCRC = CalculateCRC8(Message.RxData, newLength);
+	Message.RxData[6]= UTL_Dec2Asc(newCRC / 16);
+	Message.RxData[7]= UTL_Dec2Asc(newCRC % 16);
+	//Send data to all UARTS
+	HAL_UART_Transmit(&huart2, Message.RxData,newLength,100);
+	HAL_UART_Transmit(&huart3, Message.RxData,newLength,100);
+	//Empty data buffer
+	Message.Length = 0;
+	Message.MType = 0;
+	Message.Counter = 0;
+	Message.CRCValue = 0;
+	Message.RxBuffer = 0;
+	memset(Message.RxData, 0, sizeof(Message.RxData));
+	SER_Busy = 0;
+}
+
+//-----------------------------------------------------------------------------
+//! \brief      Converts the byte from the recipe to an integer
+//! \details    Converts the hex bytes to an integer, returns the integer
+//! \param[in]  uint8_t newUart			Uart number
+//! \param[in]  uint8_t newStartByte	Start byte of the hex string
+//! \param[in]  uint8_t newLength		Length of the hex string [2 or 4 bytes]
+//! \param[out]	uint16_t ReturnValue
+uint16_t SER_GetValue (uint8_t newStartByte, uint8_t newLength)
+{
+	uint16_t returnValue = 0;
+	if (newLength == 1)
+		returnValue = UTL_Asc2Dec(Message.RxData[newStartByte]);
+	else if (newLength == 2)
+		returnValue = UTL_Asc2Dec(Message.RxData[newStartByte]) * 16 + UTL_Asc2Dec(Message.RxData[newStartByte + 1]);
+	else if (newLength == 4)//4 bytes
+		returnValue = UTL_Asc2Dec(Message.RxData[newStartByte]) * 4096 + UTL_Asc2Dec(Message.RxData[newStartByte + 1]) * 256 + UTL_Asc2Dec(Message.RxData[newStartByte + 2]) * 16 + UTL_Asc2Dec(Message.RxData[newStartByte + 3]);
+	return returnValue;
+}
+//-----------------------------------------------------------------------------
+//! \brief      Fills the buffer according to the byte count
+//! \details    Fills the buffer with converted characters
+//! \param[in]  uint8_t newPosition		Position in the array
+//! \Param[in]	uint8_t newByteCount	1 byte = 2 hex positions
+//! \Param[in]	uint64_t newValue
+void SER_FillData (uint8_t newPosition, uint8_t newByteCount, uint64_t newValue)
+{
+	uint64_t CompareValue;
+	if (newByteCount == 1) CompareValue = 0xF0;
+	if (newByteCount == 2) CompareValue = 0xF000;
+	if (newByteCount == 4) CompareValue = 0xF0000000;
+	if (newByteCount == 8) CompareValue = 0xF000000000000000;
+
+	for (uint8_t i = 0; i < (newByteCount * 2); i++)
+	{
+		Message.RxData[newPosition + i] = UTL_Dec2Asc(((newValue & (CompareValue >> i*4)) >> (4 * ((newByteCount * 2) - 1 - i))));
+	}
+}
+
+uint8_t SER_FillBuffer (uint8_t newPosition, uint16_t MType)
+{
+	volatile uint8_t Counter = 0;
+	uint8_t ReturnValue = 0;
+	if (MType == MTypeSendPartitionBlock)
+	{
+		SER_FillData(newPosition, 2, (uint32_t) FLA[pUpdate].Version);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].LastBlock);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].NrOfBlocks);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].Status);
+		ReturnValue = Counter+=4;
+	}
+	else if ((MType == MTypeGetPartitionInfo) || (MType == MTypeUpgradeApplication) || (MType == MTypeSetPartitionStatus))
+	{
+		SER_FillData(newPosition, 2, (uint32_t) FLA[pApplication].Version);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pApplication].Status);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pRollBack].Version);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pRollBack].Status);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].Version);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].LastBlock);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].NrOfBlocks);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pUpdate].Status);
+		ReturnValue = Counter+=4;
+	}
+	else if ((MType == MTypeGetBackupProgress)||(MType == MTypeGetRestoreProgress))
+	{
+		Message.RxData[0] = '/';
+		Message.RxData[1] = '1';
+		SER_FillData(4, 1, (uint32_t) MType);
+		SER_FillData(newPosition, 2, (uint32_t) Progress);
+		ReturnValue = Counter+=4;
+	}
+	else if (MType == MTypeGetUpdateProgress)
+	{
+		Message.RxData[0] = '/';
+		Message.RxData[1] = '1';
+		SER_FillData(4, 1, (uint32_t) MType);
+		SER_FillData(newPosition, 2, (uint32_t) Progress);
+		ReturnValue = Counter+=4;
+	}
+	else if (MType == MTypeGetBootloaderStatus)
+	{
+		Message.RxData[0] = '/';
+		//UART protocol 1
+		Message.RxData[1] = '1';
+		Message.RxData[4] = '2';
+		Message.RxData[5] = '5';
+		SER_FillData(newPosition, 2, (uint32_t) BootloaderStatus);
+		SER_FillData(newPosition+(Counter+=4), 2, (uint32_t) FLA[pApplication].Status);
+		ReturnValue = Counter+=4;
+	}
+	return ReturnValue;
+}
+
+//-----------------------------------------------------------------------------
+//! \brief      Handles the serial actions
+//! \details    Process the message
+//! \params     None
+void SER_Handle (void)
+{
+	SER_ProcessMessage ();
+	if(HAL_UART_GetError(&huart2))
+	{
+		HAL_UART_DMAStop(&huart2);
+		MX_USART2_UART_Init();
+		HAL_UART_Receive_DMA(&huart2, &Message.RxBuffer, 1);
+	}
+	if(HAL_UART_GetError(&huart3))
+	{
+		HAL_UART_DMAStop(&huart3);
+		MX_USART2_UART_Init();
+		HAL_UART_Receive_DMA(&huart3, &Message.RxBuffer, 1);
+	}
+}
+
+//-----------------------------------------------------------------------------
+//! \brief      Processes the message
+//! \details    Checks if the complete message is received and if so processes it
+//! \param      None
+void SER_ProcessMessage (void)
+{
+	static uint8_t LED_Flag;
+	uint8_t DataLength;
+	if	((Message.Counter > 0) &&(Message.Counter == Message.Length))  //Message received completely
+	{
+		SER_Busy = 1;
+		//Check CRC
+		//WRK_ResetAction(); //Cancel the current action in case this is pending as the return message is scrambled.
+		CalculatedCRC = CalculateCRC8(Message.RxData, Message.Length);
+		if (CalculatedCRC != Message.CRCValue) //Invalid CRC.
+		{
+			SER_SendReturnMessage (10,MStatCRCError);
+		}
+		else if (Message.UARTVersion != UARTVERSION)
+		{
+			SER_SendReturnMessage (10,MStatUARTVersionError);
+		}
+		else if (Message.MType == MTypeSendPartitionBlock) //Application upgrade is being sent
+		{
+			if (LED_Flag == 0)
+			{
+				LED_Flag = 1;
+				LED_Set(STANDBYLED, BLINKING, 0, 255, 0, 50, 500, 500, 5, 0, 0); //Blinking normal GREEN
+			}
+			FLA_HandleSendPartitionBlock();
+		}
+		else if (Message.MType == MTypeUpgradeApplication)
+		{
+			FLA_HandleUpgradeApplication();
+		}
+		else if (Message.MType == MTypeRestorePartition)
+		{
+			FLA_RestorePartition();
+		}
+		else if (Message.MType == MTypeGetPartitionInfo) //Get image info in flash
+		{
+			DataLength = SER_FillBuffer(10, Message.MType);
+			SER_SendReturnMessage (DataLength + 10,MStatSuccess);
+		}
+		else if (Message.MType == MTypeSetPartitionStatus) //Application upgrade is being sent
+		{
+			FLA_SetStatus(pUpdate,(enuFLA) SER_GetValue (10,2));
+			DataLength = SER_FillBuffer(10, Message.MType);
+			SER_SendReturnMessage (DataLength + 10,MStatSuccess);
+		}
+		else if (Message.MType == MTypeSetLED)
+		{
+			LED_Set(SER_GetValue (12,1), SER_GetValue (13,1), SER_GetValue (14,2), SER_GetValue (16,2), SER_GetValue (18,2), SER_GetValue (20,2), SER_GetValue (22,4), SER_GetValue (26,4), SER_GetValue (30,2), SER_GetValue (32,4), SER_GetValue (36,2));
+			SER_SendReturnMessage (10,MStatSuccess);
+		}
+		else if (Message.MType == MTypeReboot)
+		{
+			SER_SendReturnMessage (10,MStatSuccess);
+			HAL_NVIC_SystemReset();
+		}
+		else //Message type is unknown to bootloader
+		{
+			SER_SendReturnMessage (10,MStatUnknownType);
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+//! \brief      Handles the UART interrupt from DMA
+//! \details    Resets the buffer counter if 0x1B is received
+//! \details    Checks the length of the message and limits to MDataMax
+//! \details    Fills the rest of the data buffer until the length of the message is received
+//! \param      None
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (SER_Busy) return;
+	uint8_t CurrentValue;
+
+	if(huart->Instance == USART2)  //Received from debugging interface
+	{
+		UartReturn = 2;
+	}
+	else if(huart->Instance == USART3)  //Received from linux system
+	{
+		UartReturn = 3;
+	}
+	CurrentValue = UTL_Asc2Dec(Message.RxBuffer);
+
+	Message.RxData[Message.Counter] = Message.RxBuffer;
+	if (Message.RxBuffer == 0x2f) //Start byte. Reset Rx counter
+	{
+		Message.Counter = 1;
+	}
+	else if (Message.Counter == 1) //UART protocol
+	{
+		Message.UARTVersion = CurrentValue;
+		Message.Counter = 2;
+	}
+	else if (Message.Counter == 2) //Length MSB received
+	{
+		Message.Length = CurrentValue * 16;
+		Message.Counter = 3;
+	}
+	else if (Message.Counter == 3) //Length LSB received
+	{
+		Message.Length += CurrentValue;
+		if (Message.Length > MLengthMax)
+			Message.Length = MLengthMax; //Prevent buffer overflow
+		Message.Counter = 4;
+	}
+	else if	(Message.Counter == 4) //Message type MSB received
+	{
+		Message.MType = CurrentValue * 16;
+		Message.Counter = 5;
+	}
+	else if	(Message.Counter == 5) //Message type LSB received
+	{
+		Message.MType += CurrentValue;
+		Message.Counter = 6;
+	}
+	else if	(Message.Counter == 6) //CRC MSB received
+	{
+		Message.CRCValue = CurrentValue * 16;
+		Message.Counter = 7;
+	}
+	else if	(Message.Counter == 7) //CRC LSB received
+	{
+		Message.CRCValue += CurrentValue;
+		Message.Counter = 8;
+	}
+	else if	(Message.Counter < Message.Length) //Any byte received
+	{
+		Message.Counter ++;
+	}
+}
+
+
+//---------------- End of file -----------------------

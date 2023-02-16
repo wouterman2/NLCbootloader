@@ -1,0 +1,27 @@
+//-----------------------------------------------------------------------------
+//! \file       work.h
+//! \author     R. Weimar
+//! \brief      Contains routines for the work module
+//! \details
+//! \Attention
+//-----------------------------------------------------------------------------
+#ifndef INC_WORK_H_
+#define INC_WORK_H_
+//-----------------------------------------------------------------------------
+#define LED_SPI 1
+//! \brief  includes
+#include "defines.h"
+#include <stdint.h>
+#define	STAYINBOOTLOADER 0
+//-----------------------------------------------------------------------------
+uint8_t WRK_HandleCopyBlocks (uint32_t newNrOfBlocks, uint32_t newSourceAddress, uint32_t newDestinationAddress);
+//-----------------------------------------------------------------------------
+extern uint8_t Initialized;
+extern volatile uint8_t Flg1ms;
+extern uint16_t Progress;
+extern int32_t ProgressOld;
+extern void WRK_HandleTickTime (void);
+extern void WRK_Handle (void);
+extern void WRK_StartApplication(void);
+#endif /* INC_WORK_H_ */
+

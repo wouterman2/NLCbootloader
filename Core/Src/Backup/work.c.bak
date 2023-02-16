@@ -1,0 +1,340 @@
+//-----------------------------------------------------------------------------
+//! \file       work.c
+//! \author     R. Weimar. RMB Holland bv
+//! \brief      Contains routines for the general sequence
+//! \details
+//! \Attention
+//! \Created on: May 5, 2022
+//-----------------------------------------------------------------------------
+
+#include "work.h"
+#include "serial.h"
+#include "flash.h"
+#include "eeprom.h"
+#include "led.h"
+#include "spi.h"
+#include "iwdg.h"
+#include <string.h>
+
+//! \Global tick time flag
+volatile uint8_t Flg1ms = 0;
+//! \Global flag to indicate all modules are initialized
+uint8_t Initialized;
+//! \Global progress indicator
+uint16_t Progress;
+int32_t ProgressOld;
+//-----------------------------------------------------------------------------
+//! \brief      Handles the tick time counter
+//! \details    Handles 1 ms time interrupt
+//! \param      None
+void WRK_HandleTickTime (void)
+{
+	if (!Initialized) return;
+	HAL_IWDG_Refresh(&hiwdg);
+	SER_Handle();
+	LED_Handle();
+}
+//-----------------------------------------------------------------------------
+//! \brief      Copies blocks of data from one address to another
+//! \details    Arranges the erase of the page to write to.
+//! \param[in]  uint32_t newNrOfBlocks, uint32_t newSourceAddress, uint32_t newDestinationAddress
+//! \param[out] Result  1 = OK, 2 = Error
+uint8_t WRK_HandleCopyBlocks (uint32_t newNrOfBlocks, uint32_t newSourceAddress, uint32_t newDestinationAddress)
+{
+	uint8_t Result = 0;
+	uint8_t DataLength;
+	uint32_t CurrentSourceAddress;
+	uint32_t CurrentDestinationAddress;
+	Progress = 0;
+	ProgressOld = -1;
+	for (CurrentBlock = 0; CurrentBlock < newNrOfBlocks  ;CurrentBlock++)
+	{
+		CurrentSourceAddress = newSourceAddress + (CurrentBlock * FLA_BLOCKSIZE);
+		CurrentDestinationAddress = newDestinationAddress + (CurrentBlock * FLA_BLOCKSIZE);
+		//Check if a page needs to be erased
+		if (CurrentBlock % FLA_BLOCKSPERPAGE == 0)//new page
+		{
+			//Erase the new application page in order to be able to write to it
+			if (FLA_ErasePage (CurrentDestinationAddress) != HAL_OK)
+			{
+			  SER_SendReturnMessage (10,MStatErasePageError);
+			  CurrentBlock = 65535;
+			}
+		}
+		//Clear the array to zero before filling the next block
+		memset(ImageData, 0, sizeof(ImageData)); //Reset the buffer
+		FLA_ReadBlock (CurrentSourceAddress);
+		//Write the block to the destinationaddress
+		FLA_WriteBlock (CurrentDestinationAddress);
+		//Verify the written page
+		if (FLA_VerifyBlock (CurrentDestinationAddress) == 0)
+		{
+			SER_SendReturnMessage (10,MStatVerifyError);
+			CurrentBlock = 65535;
+		}
+		else
+		{
+			Progress = ((CurrentBlock + 1) * 100) / newNrOfBlocks;
+			if (Progress != ProgressOld)
+			{
+				ProgressOld = Progress;
+				if (newSourceAddress == FLA_MAINADDRESS) //Backup
+					DataLength = SER_FillBuffer(10, MTypeGetBackupProgress);
+				else if (newSourceAddress == FLA_ROLLBACKADDRESS) //Restore
+					DataLength = SER_FillBuffer(10, MTypeGetRestoreProgress);
+				else
+					DataLength = SER_FillBuffer(10, MTypeGetUpdateProgress);
+				UartReturn = 2; //Select UART2
+				SER_SendReturnMessage (DataLength + 10,MStatSuccess);
+			}
+		}
+	}
+	Result = (CurrentBlock == 65535) + 1; //1 = OK, 2 = Error
+	return Result;
+}
+//-----------------------------------------------------------------------------
+//! \brief      Handles the startup of the system
+//! \details    Checks if there is an update or ollback pending. If not, starts the application
+//! \details    If there is no valid application will be ready to receive UART commands
+//! \param      None
+void WRK_Handle(void)
+{
+	uint8_t Result = 0;
+	uint8_t DataLength;
+	BootloaderStatus = sACTIVE;
+	DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+	SER_SendReturnMessage (DataLength + 10,MStatNone);
+	if (FLA[pApplication].Status == fCORRUPT)
+	{
+		DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+		SER_SendReturnMessage (DataLength + 10,MStatImageNotValid);
+		LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+	}
+	else if (FLA[pApplication].Status == fUPDATING)
+	{
+		if (FLA[pUpdate].Status != fVALID) //Upgrade image is not valid. Abort upgrade
+		{
+			LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+			//Set Bootloader to ERROR state
+			BootloaderStatus = sUNITERROR;
+			//Upgrade is canceled. Set Application status to VALID again. Otherwise next reboot, the upgrade will be tried again.
+			if (FLA[pApplication].Version > 0)
+				FLA_SetStatus(pApplication,fVALID);
+			else
+				FLA_SetStatus(pApplication,fUNDEFINED);
+			//Send UART message
+			DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+			SER_SendReturnMessage (DataLength + 10,MStatImageNotValid);
+			LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+		}
+		else
+		{
+			DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+			SER_SendReturnMessage (DataLength + 10,MStatNone);
+			LED_Set(STANDBYLED, SWITCHEDON, 0, 0, 255, 50, 500, 500, 5, 0, 0); //On BLUE
+			LED_Handle();
+			//Perform the copy of the image
+			//Backup the current application if present. If not, skip this step
+			if ((FLA[pApplication].Version > 0) && (((*(__IO uint32_t*) FLA_MAINADDRESS) & 0x2FFE0000) == 0x20000000))//Application is present
+			{
+				FLA_SetStatus(pRollBack, fUPDATING);
+				FLA_SetVersion(pRollBack, FLA[pApplication].Version);
+				Result = WRK_HandleCopyBlocks (FLA_LENGTH/FLA_BLOCKSIZE, FLA_MAINADDRESS, FLA_ROLLBACKADDRESS);
+				if (Result == 1) //Copy succeeded. Set Statuses for rollback version
+				{
+					FLA_SetStatus(pRollBack, fVALID);
+				}
+			}
+			else
+			{
+				Result = 1;
+			}
+			//Do the actual reading and writing
+			if (Result == 1) //Copy succeeded. Set Statuses for rollback version
+			{
+				Result = WRK_HandleCopyBlocks (FLA[pUpdate].NrOfBlocks, FLA_UPGRADEADDRESS, FLA_MAINADDRESS);
+				if (Result == 1)
+				{
+					LED_Set(STANDBYLED, SWITCHEDON, 0, 0, 255, 50, 500, 500, 5, 0, 0); //On BLUE
+					//Set Bootloader to IDLE state
+					BootloaderStatus = sIDLE;
+					//Write the application status
+					FLA_SetStatus(pApplication, fUPDATED);
+					FLA_SetVersion(pApplication, FLA[pUpdate].Version);
+					//Send the status
+					HAL_Delay(100);
+					DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+					SER_SendReturnMessage (DataLength + 10,MStatSuccess);
+					//Reboot the system
+					//HAL_NVIC_SystemReset();
+					WRK_StartApplication(); //Try the application
+				}
+				else
+				{
+					//Corrupted application. Stay in bootloader
+					LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+				}
+			}
+			else
+			{
+				//Saving of roll back partition failed. Start old application
+				DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+				SER_SendReturnMessage (DataLength + 10,MStatCreateRollBackError);
+				WRK_StartApplication(); //Try to start the old application
+			}
+		}
+	}
+	else if (FLA[pApplication].Status == fROLLBACK)
+	{
+		if (FLA[pRollBack].Status != fVALID) //RollBack image is not valid. Abort Roll back
+		{
+			//Set Bootloader to ERROR state
+			BootloaderStatus = sUNITERROR;
+			//Upgrade is canceled. Set Application status to VALID again. Otherwise next reboot, the upgrade will be tried again.
+			if (FLA[pApplication].Version > 0)
+				FLA_SetStatus(pApplication,fVALID);
+			else
+				FLA_SetStatus(pApplication,fUNDEFINED);
+			//Send UART message
+			DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+			SER_SendReturnMessage (DataLength + 10,MStatImageNotValid);
+			LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+		}
+		else
+		{
+			DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+			SER_SendReturnMessage (DataLength + 10,MStatNone);
+			LED_Set(STANDBYLED, SWITCHEDON, 255, 0, 0, 50, 500, 500, 5, 0, 0); //On RED
+			LED_Handle();
+			//Perform the copy of the image
+			//Backup the current application
+			Result = WRK_HandleCopyBlocks (FLA[pRollBack].NrOfBlocks, FLA_ROLLBACKADDRESS, FLA_MAINADDRESS);
+			if (Result == 1)
+			{
+				//Set Bootloader to IDLE state
+				BootloaderStatus = sIDLE;
+				//Write the application status
+				FLA_SetStatus(pApplication, fUPDATED);
+				FLA_SetVersion(pApplication, FLA[pUpdate].Version);
+				//Send the status
+				DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+				SER_SendReturnMessage (DataLength + 10,MStatNone);
+				//Reboot the system
+				//HAL_NVIC_SystemReset();
+				WRK_StartApplication(); //Try the application
+			}
+			else
+			{
+				//Corrupted application. Stay in bootloader
+				LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+			}
+		}
+	}
+	else if (FLA[pApplication].Status == fUPDATED)//Application didn't start and change status to VALID, so roll back
+	{
+		if (FLA[pRollBack].Status == fVALID)
+		{
+			LED_Set(STANDBYLED, SWITCHEDON, 255, 0, 0, 50, 500, 500, 5, 0, 0); //On RED
+			LED_Handle();
+			Result = WRK_HandleCopyBlocks (FLA_LENGTH/FLA_BLOCKSIZE, FLA_ROLLBACKADDRESS, FLA_MAINADDRESS); //Handle retry and or roll back
+			if (Result == 1)
+			{
+				//Set Bootloader to IDLE state
+				BootloaderStatus = sIDLE;
+				//Write the application status
+				FLA_SetStatus(pApplication, fUPDATED);
+				FLA_SetVersion(pApplication, FLA[pRollBack].Version);
+				//Send the status
+				DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+				SER_SendReturnMessage (DataLength + 10,MStatNone);
+				//Reboot the system
+				//HAL_NVIC_SystemReset();
+				WRK_StartApplication(); //Try the application
+			}
+			else
+			{
+				//Corrupted application. Stay in bootloader
+				LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+			}
+		}
+		else
+		{
+			//Corrupted application. Stay in bootloader
+			LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+		}
+
+	}
+	else if (FLA[pApplication].Status == fVALID)//Normal startup
+	{
+		WRK_StartApplication();
+	}
+	else if (FLA[pApplication].Status == fUNDEFINED)//EEprom is empty at startup
+	{
+		if (((*(__IO uint32_t*) FLA_MAINADDRESS) & 0x2FFE0000) == 0x20000000)//EEprom is empty at startup but an image is present
+		{
+			WRK_StartApplication();
+		}
+		else
+		{
+			//No application present. Stay in bootloader
+			LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+		}
+	}
+	else //Cannot start, because there is no valid partition. Stay in bootloader, so an application can be loaded
+	{
+		LED_Set(STANDBYLED, BLINKING, 255, 0, 0, 50, 100, 100, 5, 0, 0); //Blinking fast RED
+	}
+
+}
+//-----------------------------------------------------------------------------
+//! \brief      Starts the application
+//! \details    Sets the stack pointer to the application partition
+//! \param      None
+void WRK_StartApplication(void)
+{
+	uint8_t DataLength;
+	if (STAYINBOOTLOADER) return;
+	if (((*(__IO uint32_t*) FLA_MAINADDRESS) & 0x2FFE0000) != 0x20000000)
+	{
+		//No valid application
+		//Inform the Linux
+		DataLength = SER_FillBuffer(10, MTypeGetBootloaderStatus);
+		SER_SendReturnMessage (DataLength + 10,MStatImageNotValid);
+		return;
+	}
+   //just a function pointer to hold the address of the reset handler of the user app.
+    void (*app_reset_handler)(void);
+
+    //shut down any tasks running
+    /*HAL_GPIO_DeInit(GPIOB, GPIO_PIN_10);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_11);
+    HAL_TIM_Base_Stop_IT(&htim4);
+    HAL_TIM_Base_DeInit(&htim4);
+    */
+    HAL_RCC_DeInit();
+    HAL_SPI_MspDeInit(&hspi1);
+    HAL_DeInit();
+
+
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL = 0;
+
+    //disbale interuppts
+    __set_PRIMASK(1);
+    __disable_irq();
+     SCB->VTOR = FLA_MAINADDRESS;
+
+    // 1. configure the MSP by reading the value from the base address of the sector 2
+    uint32_t msp_value = *(__IO uint32_t *)FLA_MAINADDRESS;
+
+    __set_MSP(msp_value);
+
+    uint32_t resethandler_address = *(__IO uint32_t *) (FLA_MAINADDRESS + 4);
+
+    app_reset_handler = (void*) resethandler_address;
+
+    //3. jump to reset handler of the user application
+    app_reset_handler();
+
+}
